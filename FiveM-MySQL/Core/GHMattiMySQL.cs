@@ -1,7 +1,9 @@
 ﻿using CitizenFX.Core;
 using CitizenFX.Core.Native;
-using GHMatti.Core;
-using GHMatti.MySQL;
+using GHMatti.Data.MySQL;
+using GHMatti.Data.MySQL.Core;
+using GHMatti.Data.MySQL.Utilities;
+using GHMatti.Utilities;
 using System;
 using System.IO;
 using System.Linq;
@@ -21,7 +23,7 @@ namespace GHMattiMySQL
         /// </summary>
         private GHMattiTaskScheduler taskScheduler;
         private MySQL mysql;
-        private MySQLSettings settings;
+        private Settings settings;
         private bool initialized;
 
         /// <summary>
@@ -30,20 +32,20 @@ namespace GHMattiMySQL
         public Core()
         {
             taskScheduler = new GHMattiTaskScheduler();
-            settings = new MySQLSettings();
+            settings = new Settings();
             initialized = false;
             EventHandlers["onServerResourceStart"] += new Action<string>(Initialization);
 
             Exports.Add("Query", new Func<string, dynamic, Task<long>>(
                 (query, parameters) => Query(query, parameters))
             );
-            Exports.Add("QueryResult", new Func<string, dynamic, Task<MySQLResult>>(
+            Exports.Add("QueryResult", new Func<string, dynamic, Task<ResultSet>>(
                 (query, parameters) => QueryResult(query, parameters))
             );
             Exports.Add("QueryScalar", new Func<string, dynamic, Task<object>>(
                 (query, parameters) => QueryScalar(query, parameters))
             );
-            Exports.Add("TransactionAsync", new Func<dynamic, dynamic, Task<bool>>(
+            Exports.Add("Transaction", new Func<dynamic, dynamic, Task<bool>>(
                 (querys, parameters) => Transaction(querys, parameters))
             );
 
@@ -69,7 +71,7 @@ namespace GHMattiMySQL
         /// Initialization function. Nothing will execute before this is not done. Maybe remove the async and await?
         /// </summary>
         /// <param name="resourcename">Gets autoset to the resource that is started</param>
-        private async void Initialization(string resourcename)
+        private void Initialization(string resourcename)
         {
             if (API.GetCurrentResourceName() == resourcename)
             {
@@ -78,7 +80,7 @@ namespace GHMattiMySQL
                 taskScheduler.ThreadLimit = API.GetConvarInt("mysql_thread_limit", 0);
                 // You cannot do API Calls in these Threads, you need to do them before or inbetween. Use them only for heavy duty work,
                 // (file operations, database interaction or transformation of data), or when working with an external library.
-                await Task.Factory.StartNew(() =>
+                Task.Factory.StartNew(() =>
                 {
                     XDocument xDocument = XDocument.Load(Path.Combine("resources", resourcename, "settings.xml"));
                     settings.XMLConfiguration = xDocument.Descendants("setting").ToDictionary(
@@ -102,7 +104,7 @@ namespace GHMattiMySQL
         private async Task<long> Query(string query, dynamic parameters)
         {
             await Initialized();
-            return await mysql.Query(query, Parameters.TryParse(parameters));
+            return await mysql.Query(query, Utility.TryParseParameters(parameters));
         }
 
         /// <summary>
@@ -111,10 +113,10 @@ namespace GHMattiMySQL
         /// <param name="query">The mysql database query string</param>
         /// <param name="parameters">Ideally an IDictionary or table of parameters, can be null, will be parsed</param>
         /// <returns>The result table that was queried</returns>
-        private async Task<MySQLResult> QueryResult(string query, dynamic parameters)
+        private async Task<ResultSet> QueryResult(string query, dynamic parameters)
         {
             await Initialized();
-            return await mysql.QueryResult(query, Parameters.TryParse(parameters));
+            return await mysql.QueryResult(query, Utility.TryParseParameters(parameters));
         }
 
         /// <summary>
@@ -126,7 +128,7 @@ namespace GHMattiMySQL
         private async Task<dynamic> QueryScalar(string query, dynamic parameters)
         {
             await Initialized();
-            return await mysql.QueryScalar(query, Parameters.TryParse(parameters));
+            return await mysql.QueryScalar(query, Utility.TryParseParameters(parameters));
         }
 
         /// <summary>
@@ -138,12 +140,10 @@ namespace GHMattiMySQL
         private async void QueryAsync(string query, dynamic parameters, CallbackDelegate callback = null)
         {
             await Initialized();
-            long result = await mysql.Query(query, Parameters.TryParse(parameters, settings.Debug));
-            if (callback != null)
-            {
-                await Delay(0); // need to wait for the next server tick before invoking, will error otherwise
-                callback.Invoke(result);
-            }
+            Task<long> resultTask = mysql.Query(query, Utility.TryParseParameters(parameters, settings.Debug));
+#pragma warning disable CS4014
+            resultTask.ContinueWith((task) => callback?.Invoke(task.Result));
+#pragma warning restore CS4014
         }
 
         /// <summary>
@@ -155,12 +155,10 @@ namespace GHMattiMySQL
         private async void QueryResultAsync(string query, dynamic parameters, CallbackDelegate callback = null)
         {
             await Initialized();
-            dynamic result = await mysql.QueryResult(query, Parameters.TryParse(parameters, settings.Debug));
-            if (callback != null)
-            {
-                await Delay(0);
-                callback.Invoke(result);
-            }
+            Task<ResultSet> resultTask = mysql.QueryResult(query, Utility.TryParseParameters(parameters, settings.Debug));
+#pragma warning disable CS4014
+            resultTask.ContinueWith((task) => callback?.Invoke(task.Result));
+#pragma warning restore CS4014
         }
 
         /// <summary>
@@ -172,12 +170,10 @@ namespace GHMattiMySQL
         private async void QueryScalarAsync(string query, dynamic parameters, CallbackDelegate callback = null)
         {
             await Initialized();
-            object result = await mysql.QueryScalar(query, Parameters.TryParse(parameters, settings.Debug));
-            if (callback != null)
-            {
-                await Delay(0);
-                callback.Invoke(result);
-            }
+            Task<object> resultTask = mysql.QueryScalar(query, Utility.TryParseParameters(parameters, settings.Debug));
+#pragma warning disable CS4014
+            resultTask.ContinueWith((task) => callback?.Invoke(task.Result));
+#pragma warning restore CS4014
         }
 
         /// <summary>
@@ -190,14 +186,12 @@ namespace GHMattiMySQL
         private async void Insert(string table, dynamic parameters, CallbackDelegate callback = null, bool lastInsertId = false)
         {
             await Initialized();
-            MultiRow multiRow = await ParseMultiRow(table, parameters);
+            MultiRowCommandBuilder multiRow = await ParseMultiRow(table, parameters);
             bool isInsert = (callback == null) ? false : lastInsertId;
-            long result = await mysql.Query(multiRow.CommandText, multiRow.Parameters, isInsert);
-            if (callback != null)
-            {
-                await Delay(0);
-                callback.Invoke(result);
-            }
+            Task<long> resultTask = mysql.Query(multiRow.CommandText, multiRow.Parameters, isInsert);
+#pragma warning disable CS4014
+            resultTask.ContinueWith((task) => callback?.Invoke(task.Result));
+#pragma warning restore CS4014 
         }
 
         /// <summary>
@@ -209,7 +203,7 @@ namespace GHMattiMySQL
         private async Task<bool> Transaction(dynamic querys, dynamic parameters)
         {
             await Initialized();
-            return await mysql.Transaction(TryParseTransactionQuerys(querys), Parameters.TryParse(parameters));
+            return await mysql.Transaction(Utility.TryParseTransactionQuerys(querys), Utility.TryParseParameters(parameters));
         }
 
         /// <summary>
@@ -221,12 +215,10 @@ namespace GHMattiMySQL
         private async void TransactionAsync(dynamic querys, dynamic parameters, CallbackDelegate callback = null)
         {
             await Initialized();
-            bool result = await mysql.Transaction(TryParseTransactionQuerys(querys), Parameters.TryParse(parameters));
-            if (callback != null)
-            {
-                await Delay(0);
-                callback.Invoke(result);
-            }
+            Task<bool> resultTask = mysql.Transaction(Utility.TryParseTransactionQuerys(querys), Utility.TryParseParameters(parameters));
+#pragma warning disable CS4014
+            resultTask.ContinueWith((task) => callback?.Invoke(task.Result));
+#pragma warning restore CS4014 
         }
 
         /// <summary>
@@ -235,9 +227,9 @@ namespace GHMattiMySQL
         /// <param name="table">Name of the table</param>
         /// <param name="parameters">List of dictionarys which represent each row inserted</param>
         /// <returns>Returns the MultiRow object which consists of a built query string and a set of parameters</returns>
-        private async Task<MultiRow> ParseMultiRow(string table, dynamic parameters) => await Task.Factory.StartNew(() =>
+        private async Task<MultiRowCommandBuilder> ParseMultiRow(string table, dynamic parameters) => await Task.Factory.StartNew(() =>
         {
-            return MultiRow.TryParse(table, parameters);
+            return MultiRowCommandBuilder.TryParse(table, parameters);
         }, CancellationToken.None, TaskCreationOptions.None, taskScheduler);
 
         /// <summary>
@@ -248,26 +240,6 @@ namespace GHMattiMySQL
         {
             while (!initialized)
                 await Delay(0);
-        }
-
-        /// <summary>
-        /// Check if the user supplied queries are in the correct shape, move this somewhere else later
-        /// </summary>
-        /// <param name="querys">List of queries, if not it errors</param>
-        /// <returns>Parsed List of queries</returns>
-        public static System.Collections.Generic.IList<string> TryParseTransactionQuerys(dynamic querys)
-        {
-            System.Collections.Generic.IList<string> parsedList = null;
-            try
-            {
-                parsedList = ((System.Collections.Generic.IList<object>)querys).Select(query => query.ToString()).ToList();
-            }
-            catch
-            {
-                throw new System.Exception("[GHMattiMySQL ERROR] Parameters are not in List-shape");
-            }
-
-            return parsedList;
         }
     }
 }
